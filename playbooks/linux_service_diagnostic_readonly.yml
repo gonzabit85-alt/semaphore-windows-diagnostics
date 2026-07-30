@@ -1,0 +1,100 @@
+---
+- name: Read-only diagnostic for Linux systemd service alert
+  hosts: "{{ target_host | default('linux_alerts') }}"
+  gather_facts: true
+
+  vars:
+    diagnostic_service_name: "{{ service_name | default('') }}"
+    diagnostic_alert_name: "{{ alert_name | default('') }}"
+    diagnostic_window_hours: "{{ window_hours | default(6) | int }}"
+
+  tasks:
+    - name: Validate diagnostic input
+      ansible.builtin.assert:
+        that:
+          - diagnostic_service_name | length > 0
+          - diagnostic_window_hours | int > 0
+          - diagnostic_window_hours | int <= 168
+
+    - name: Query systemd service properties
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - "{{ diagnostic_service_name }}"
+          - --no-pager
+          - --property=Id,Description,LoadState,ActiveState,SubState,UnitFileState,MainPID,ExecMainStatus,ExecMainCode,Result,NRestarts,FragmentPath
+      changed_when: false
+      failed_when: false
+      register: service_properties
+
+    - name: Query systemd service dependencies
+      ansible.builtin.command:
+        argv: [systemctl, list-dependencies, "{{ diagnostic_service_name }}", --no-pager, --plain]
+      changed_when: false
+      failed_when: false
+      register: service_dependencies
+
+    - name: Query recent warning and error journal entries
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --unit
+          - "{{ diagnostic_service_name }}"
+          - --since
+          - "{{ diagnostic_window_hours }} hours ago"
+          - --priority
+          - warning
+          - --no-pager
+          - --output
+          - short-iso
+          - --lines
+          - "30"
+      changed_when: false
+      failed_when: false
+      register: service_journal
+
+    - name: Query host resource summary
+      ansible.builtin.shell: |
+        set -o pipefail
+        printf '%s\n' '--- uptime ---'
+        uptime
+        printf '%s\n' '--- memory ---'
+        free -m
+        printf '%s\n' '--- filesystems ---'
+        df -P -x tmpfs -x devtmpfs
+        printf '%s\n' '--- failed units ---'
+        systemctl --failed --no-pager --plain
+        printf '%s\n' '--- oom events ---'
+        journalctl -k --since '{{ diagnostic_window_hours }} hours ago' --no-pager --grep='Out of memory|Killed process' --lines=20
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: host_health
+
+    - name: Build structured Linux diagnostic result
+      ansible.builtin.set_fact:
+        diagnostic_result:
+          schema_version: "1.0"
+          mode: read_only
+          profile: linux_systemd
+          collected_at_utc: "{{ ansible_date_time.iso8601 }}"
+          target:
+            host: "{{ inventory_hostname }}"
+            service: "{{ diagnostic_service_name }}"
+            alert: "{{ diagnostic_alert_name }}"
+          service_properties: "{{ service_properties.stdout_lines }}"
+          dependencies: "{{ service_dependencies.stdout_lines }}"
+          journal_warnings_errors: "{{ service_journal.stdout_lines }}"
+          host_health: "{{ host_health.stdout_lines }}"
+          query_errors:
+            - "{{ service_properties.stderr | default('') }}"
+            - "{{ service_dependencies.stderr | default('') }}"
+            - "{{ service_journal.stderr | default('') }}"
+          safety: No service, process, package, file, firewall, or system configuration was changed.
+      changed_when: false
+
+    - name: Print structured read-only diagnostic report
+      ansible.builtin.debug:
+        msg: "DIAGNOSTIC_RESULT_JSON={{ diagnostic_result | to_json }}"

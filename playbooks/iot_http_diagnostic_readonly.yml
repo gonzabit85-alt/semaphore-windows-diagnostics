@@ -1,0 +1,52 @@
+---
+- name: Read-only IoT HTTP endpoint diagnostic
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    diagnostic_iot_url: "{{ iot_url | default('') }}"
+    diagnostic_alert_name: "{{ alert_name | default('') }}"
+    diagnostic_validate_certs: "{{ validate_certs | default(true) | bool }}"
+
+  tasks:
+    - name: Validate IoT endpoint input
+      ansible.builtin.assert:
+        that:
+          - diagnostic_iot_url is match('^https?://')
+        fail_msg: iot_url must use HTTP or HTTPS
+
+    - name: Probe IoT endpoint without reading or changing device state
+      ansible.builtin.uri:
+        url: "{{ diagnostic_iot_url }}"
+        method: HEAD
+        return_content: false
+        follow_redirects: safe
+        validate_certs: "{{ diagnostic_validate_certs }}"
+        timeout: 10
+        status_code: [200, 204, 301, 302, 401, 403, 404, 405]
+      changed_when: false
+      failed_when: false
+      register: endpoint_result
+
+    - name: Build structured IoT diagnostic result
+      ansible.builtin.set_fact:
+        diagnostic_result:
+          schema_version: "1.0"
+          mode: read_only
+          profile: iot_http
+          collected_at_utc: "{{ ansible_date_time.iso8601 }}"
+          target:
+            url: "{{ diagnostic_iot_url | urlsplit('scheme') }}://{{ diagnostic_iot_url | urlsplit('hostname') }}{{ ':' + (diagnostic_iot_url | urlsplit('port') | string) if diagnostic_iot_url | urlsplit('port') else '' }}"
+            alert: "{{ diagnostic_alert_name }}"
+          reachable: "{{ endpoint_result.status | default(0) | int > 0 }}"
+          status_code: "{{ endpoint_result.status | default(0) }}"
+          elapsed_seconds: "{{ endpoint_result.elapsed | default(0) }}"
+          server: "{{ endpoint_result.server | default('') }}"
+          error: "{{ endpoint_result.msg | default('') }}"
+          safety: Only an HTTP HEAD request was sent; no device state or configuration was changed.
+      changed_when: false
+
+    - name: Print structured read-only diagnostic report
+      ansible.builtin.debug:
+        msg: "DIAGNOSTIC_RESULT_JSON={{ diagnostic_result | to_json }}"

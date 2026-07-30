@@ -4,86 +4,319 @@
   gather_facts: false
 
   vars:
-    diagnostic_window_hours: "{{ window_hours | default(6) }}"
+    diagnostic_window_hours: "{{ window_hours | default(6) | int }}"
     diagnostic_service_name: "{{ service_name | default('') }}"
     diagnostic_alert_name: "{{ alert_name | default('') }}"
+    diagnostic_expected_ports: "{{ expected_ports | default('') }}"
 
   tasks:
-    - name: Validate service_name input
+    - name: Validate diagnostic input
       ansible.builtin.assert:
         that:
           - diagnostic_service_name | length > 0
-        fail_msg: service_name is required for read-only service diagnostics
+          - diagnostic_window_hours | int > 0
+          - diagnostic_window_hours | int <= 168
+        fail_msg: service_name is required and window_hours must be between 1 and 168
 
-    - name: Print diagnostic scope
+    - name: Collect Windows diagnostic evidence
+      ansible.windows.win_powershell:
+        parameters:
+          ServiceName: "{{ diagnostic_service_name }}"
+          AlertName: "{{ diagnostic_alert_name }}"
+          WindowHours: "{{ diagnostic_window_hours | int }}"
+          ExpectedPorts: "{{ diagnostic_expected_ports }}"
+        script: |
+          param(
+            [string]$ServiceName,
+            [string]$AlertName,
+            [int]$WindowHours,
+            [string]$ExpectedPorts
+          )
+
+          $ErrorActionPreference = 'Stop'
+          $queryErrors = [System.Collections.Generic.List[string]]::new()
+          $findings = [System.Collections.Generic.List[object]]::new()
+          $startedAt = (Get-Date).ToUniversalTime()
+
+          function Add-Finding {
+            param([string]$Severity, [string]$Code, [string]$Message, [string]$Evidence)
+            $findings.Add([ordered]@{
+              severity = $Severity
+              code = $Code
+              message = $Message
+              evidence = $Evidence
+            })
+          }
+
+          function Convert-EventRecord {
+            param($EventRecord)
+            $message = [string]$EventRecord.Message
+            if ($message.Length -gt 1200) { $message = $message.Substring(0, 1200) }
+            [ordered]@{
+              time_utc = $EventRecord.TimeCreated.ToUniversalTime().ToString('o')
+              id = $EventRecord.Id
+              level = $EventRecord.LevelDisplayName
+              provider = $EventRecord.ProviderName
+              message = $message
+            }
+          }
+
+          $service = Get-CimInstance Win32_Service -Filter "Name='$($ServiceName.Replace("'", "''"))'" -ErrorAction SilentlyContinue
+          if (-not $service) {
+            Add-Finding 'critical' 'service_not_found' "Service '$ServiceName' was not found." 'Win32_Service returned no record.'
+          }
+
+          $serviceData = $null
+          $dependencies = @()
+          $dependentServices = @()
+          $failureActions = @()
+          $processData = $null
+          $binaryData = $null
+          $profileData = [ordered]@{}
+
+          if ($service) {
+            $serviceData = [ordered]@{
+              name = $service.Name
+              display_name = $service.DisplayName
+              state = $service.State
+              status = $service.Status
+              start_mode = $service.StartMode
+              start_name = $service.StartName
+              exit_code = $service.ExitCode
+              process_id = $service.ProcessId
+              path_name = $service.PathName
+            }
+
+            if ($service.StartMode -eq 'Auto' -and $service.State -ne 'Running') {
+              Add-Finding 'critical' 'automatic_service_stopped' 'An automatic service is not running.' "State=$($service.State); StartMode=$($service.StartMode)"
+            } elseif ($service.StartMode -eq 'Manual' -and $service.State -ne 'Running') {
+              Add-Finding 'warning' 'manual_service_stopped' 'The service is stopped and configured for manual start; validate whether this is expected.' "State=$($service.State); StartMode=$($service.StartMode)"
+            }
+
+            if ([int64]$service.ExitCode -ne 0) {
+              Add-Finding 'warning' 'service_exit_code' 'The service reports a non-zero exit code.' "ExitCode=$($service.ExitCode)"
+            }
+
+            try {
+              $serviceController = Get-Service -Name $ServiceName -ErrorAction Stop
+              $dependencies = @($serviceController.ServicesDependedOn | ForEach-Object {
+                [ordered]@{ name = $_.Name; display_name = $_.DisplayName; status = [string]$_.Status }
+              })
+              $dependentServices = @($serviceController.DependentServices | ForEach-Object {
+                [ordered]@{ name = $_.Name; display_name = $_.DisplayName; status = [string]$_.Status }
+              })
+              foreach ($dependency in $dependencies) {
+                if ($dependency.status -ne 'Running') {
+                  Add-Finding 'warning' 'dependency_not_running' 'A required service dependency is not running.' "$($dependency.name)=$($dependency.status)"
+                }
+              }
+            } catch {
+              $queryErrors.Add("dependencies: $($_.Exception.Message)")
+            }
+
+            try {
+              $failureActions = @(sc.exe qfailure $ServiceName 2>&1 | ForEach-Object { [string]$_ })
+            } catch {
+              $queryErrors.Add("failure_actions: $($_.Exception.Message)")
+            }
+
+            if ([int64]$service.ProcessId -gt 0) {
+              try {
+                $process = Get-Process -Id $service.ProcessId -ErrorAction Stop
+                $processData = [ordered]@{
+                  id = $process.Id
+                  name = $process.ProcessName
+                  start_time_utc = $process.StartTime.ToUniversalTime().ToString('o')
+                  cpu_seconds = [math]::Round($process.CPU, 2)
+                  working_set_mb = [math]::Round($process.WorkingSet64 / 1MB, 2)
+                  handles = $process.HandleCount
+                }
+              } catch {
+                $queryErrors.Add("process: $($_.Exception.Message)")
+              }
+            }
+
+            $binaryPath = $null
+            if ($service.PathName -match '^\s*"([^"]+)"') {
+              $binaryPath = $Matches[1]
+            } elseif ($service.PathName -match '^\s*([^\s]+)') {
+              $binaryPath = $Matches[1]
+            }
+            if ($binaryPath) {
+              $binaryPath = [Environment]::ExpandEnvironmentVariables($binaryPath)
+              if (Test-Path -LiteralPath $binaryPath -PathType Leaf) {
+                try {
+                  $binary = Get-Item -LiteralPath $binaryPath -ErrorAction Stop
+                  $signature = Get-AuthenticodeSignature -LiteralPath $binaryPath -ErrorAction SilentlyContinue
+                  $binaryData = [ordered]@{
+                    path = $binary.FullName
+                    exists = $true
+                    size_bytes = $binary.Length
+                    last_write_utc = $binary.LastWriteTimeUtc.ToString('o')
+                    file_version = $binary.VersionInfo.FileVersion
+                    product_version = $binary.VersionInfo.ProductVersion
+                    signature_status = [string]$signature.Status
+                    signer = [string]$signature.SignerCertificate.Subject
+                  }
+                } catch {
+                  $queryErrors.Add("binary_metadata: $($_.Exception.Message)")
+                }
+              } else {
+                $binaryData = [ordered]@{ path = $binaryPath; exists = $false }
+                Add-Finding 'critical' 'service_binary_missing' 'The configured service executable does not exist.' $binaryPath
+              }
+            }
+
+            if ($ServiceName -like 'SQLAgent*') {
+              $instance = if ($ServiceName -like '*$*') { $ServiceName.Split('$', 2)[1] } else { 'MSSQLSERVER' }
+              $engineName = if ($instance -eq 'MSSQLSERVER') { 'MSSQLSERVER' } else { "MSSQL`$$instance" }
+              $engine = Get-CimInstance Win32_Service -Filter "Name='$engineName'" -ErrorAction SilentlyContinue
+              $profileData.sql_agent = [ordered]@{
+                instance = $instance
+                engine_service = $engineName
+                engine_state = if ($engine) { $engine.State } else { 'NotFound' }
+                engine_start_mode = if ($engine) { $engine.StartMode } else { $null }
+              }
+              if (-not $engine -or $engine.State -ne 'Running') {
+                Add-Finding 'critical' 'sql_engine_not_running' 'The SQL Server engine associated with SQL Agent is not running.' "$engineName=$($profileData.sql_agent.engine_state)"
+              }
+            }
+
+            if ($ServiceName -like 'telegraf*') {
+              $configPath = $null
+              if ($service.PathName -match '(?i)--config\s+"?([^"\s]+)') { $configPath = $Matches[1] }
+              $profileData.telegraf = [ordered]@{
+                config_path = $configPath
+                config_exists = if ($configPath) { Test-Path -LiteralPath $configPath -PathType Leaf } else { $false }
+                config_last_write_utc = if ($configPath -and (Test-Path -LiteralPath $configPath -PathType Leaf)) { (Get-Item -LiteralPath $configPath).LastWriteTimeUtc.ToString('o') } else { $null }
+              }
+              if ($configPath -and -not $profileData.telegraf.config_exists) {
+                Add-Finding 'critical' 'telegraf_config_missing' 'The Telegraf configuration file referenced by the service does not exist.' $configPath
+              }
+            }
+          }
+
+          $startTime = (Get-Date).AddHours(-$WindowHours)
+          $scmEventIds = 7000, 7001, 7009, 7011, 7022, 7023, 7024, 7031, 7034, 7040
+          $scmEvents = @()
+          try {
+            $scmEvents = @(Get-WinEvent -FilterHashtable @{
+              LogName = 'System'
+              ProviderName = 'Service Control Manager'
+              StartTime = $startTime
+              Id = $scmEventIds
+            } -ErrorAction Stop |
+              Where-Object { $_.Message -like "*$ServiceName*" } |
+              Select-Object -First 12 |
+              ForEach-Object { Convert-EventRecord $_ })
+          } catch {
+            if ($_.Exception.Message -notlike '*No events were found*') { $queryErrors.Add("scm_events: $($_.Exception.Message)") }
+          }
+
+          $applicationEvents = @()
+          try {
+            $applicationEvents = @(Get-WinEvent -FilterHashtable @{
+              LogName = 'Application'
+              StartTime = $startTime
+              Level = 1, 2, 3
+            } -ErrorAction Stop |
+              Where-Object {
+                $_.ProviderName -ne 'Ansible' -and (
+                  $_.Message -like "*$ServiceName*" -or
+                  ($ServiceName -like 'SQLAgent*' -and ($_.ProviderName -like '*SQL*' -or $_.ProviderName -like '*MSSQL*')) -or
+                  ($ServiceName -like 'telegraf*' -and $_.Message -like '*telegraf*')
+                )
+              } |
+              Select-Object -First 12 |
+              ForEach-Object { Convert-EventRecord $_ })
+          } catch {
+            if ($_.Exception.Message -notlike '*No events were found*') { $queryErrors.Add("application_events: $($_.Exception.Message)") }
+          }
+
+          if ($scmEvents.Count -gt 0) {
+            Add-Finding 'warning' 'recent_scm_events' 'Relevant Service Control Manager events were found.' "count=$($scmEvents.Count)"
+          }
+          if ($applicationEvents.Count -gt 0) {
+            Add-Finding 'warning' 'recent_application_errors' 'Relevant warning or error events were found in the Application log.' "count=$($applicationEvents.Count)"
+          }
+
+          $operatingSystem = Get-CimInstance Win32_OperatingSystem
+          $processor = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+            $freePercent = if ($_.Size -gt 0) { [math]::Round(($_.FreeSpace / $_.Size) * 100, 2) } else { 0 }
+            if ($freePercent -lt 10) {
+              Add-Finding 'critical' 'disk_space_critical' 'A local disk has less than 10 percent free space.' "$($_.DeviceID)=$freePercent%"
+            } elseif ($freePercent -lt 20) {
+              Add-Finding 'warning' 'disk_space_low' 'A local disk has less than 20 percent free space.' "$($_.DeviceID)=$freePercent%"
+            }
+            [ordered]@{
+              drive = $_.DeviceID
+              size_gb = [math]::Round($_.Size / 1GB, 2)
+              free_gb = [math]::Round($_.FreeSpace / 1GB, 2)
+              free_percent = $freePercent
+            }
+          })
+
+          $pendingReboot = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+            (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+
+          $portResults = @()
+          foreach ($portText in @($ExpectedPorts -split ',' | Where-Object { $_ -match '^\s*\d+\s*$' })) {
+            $port = [int]$portText.Trim()
+            $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
+            $portResults += [ordered]@{ port = $port; listening = $listeners.Count -gt 0; listener_count = $listeners.Count }
+            if ($listeners.Count -eq 0) {
+              Add-Finding 'warning' 'expected_port_not_listening' 'An expected TCP port is not listening.' "port=$port"
+            }
+          }
+
+          $result = [ordered]@{
+            schema_version = '1.0'
+            mode = 'read_only'
+            profile = 'windows_service'
+            collected_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+            duration_ms = [math]::Round(((Get-Date).ToUniversalTime() - $startedAt).TotalMilliseconds)
+            target = [ordered]@{ host = $env:COMPUTERNAME; service = $ServiceName; alert = $AlertName }
+            summary = [ordered]@{
+              service_found = [bool]$service
+              service_state = if ($service) { $service.State } else { 'NotFound' }
+              start_mode = if ($service) { $service.StartMode } else { $null }
+              highest_severity = if ($findings.severity -contains 'critical') { 'critical' } elseif ($findings.severity -contains 'warning') { 'warning' } else { 'info' }
+            }
+            service = $serviceData
+            dependencies = $dependencies
+            dependent_services = $dependentServices
+            failure_actions = $failureActions
+            process = $processData
+            binary = $binaryData
+            profile_data = $profileData
+            host_health = [ordered]@{
+              os_caption = $operatingSystem.Caption
+              os_version = $operatingSystem.Version
+              last_boot_utc = $operatingSystem.LastBootUpTime.ToUniversalTime().ToString('o')
+              uptime_hours = [math]::Round(((Get-Date) - $operatingSystem.LastBootUpTime).TotalHours, 2)
+              memory_total_mb = [math]::Round($operatingSystem.TotalVisibleMemorySize / 1KB, 2)
+              memory_free_mb = [math]::Round($operatingSystem.FreePhysicalMemory / 1KB, 2)
+              cpu_load_percent = $processor.LoadPercentage
+              pending_reboot = $pendingReboot
+              disks = $disks
+            }
+            expected_ports = $portResults
+            events = [ordered]@{ service_control_manager = $scmEvents; application = $applicationEvents }
+            findings = @($findings)
+            query_errors = @($queryErrors)
+            safety = 'No restart, service change, registry change, file change, package change, or remediation was performed.'
+          }
+
+          $result | ConvertTo-Json -Depth 10 -Compress
+      changed_when: false
+      register: diagnostic_payload
+
+    - name: Parse structured diagnostic result
+      ansible.builtin.set_fact:
+        diagnostic_result: "{{ (diagnostic_payload.output | first) | from_json }}"
+      changed_when: false
+
+    - name: Print structured read-only diagnostic report
       ansible.builtin.debug:
-        msg:
-          mode: read_only
-          host: "{{ inventory_hostname }}"
-          ansible_host: "{{ ansible_host | default(inventory_hostname) }}"
-          alert_name: "{{ diagnostic_alert_name }}"
-          service_name: "{{ diagnostic_service_name }}"
-          window_hours: "{{ diagnostic_window_hours }}"
-          safety: No corrective action is executed by this playbook.
-
-    - name: Query Windows service state
-      ansible.windows.win_powershell:
-        script: |
-          $ErrorActionPreference = 'Stop'
-          $serviceName = '{{ diagnostic_service_name }}'
-          Get-CimInstance Win32_Service -Filter "Name='$serviceName'" |
-            Select-Object Name, DisplayName, State, Status, StartMode, StartName, ExitCode, ProcessId, PathName |
-            ConvertTo-Json -Depth 4
-      changed_when: false
-      register: service_state
-
-    - name: Query Service Control Manager events
-      ansible.windows.win_powershell:
-        script: |
-          $ErrorActionPreference = 'Stop'
-          $serviceName = '{{ diagnostic_service_name }}'
-          $startTime = (Get-Date).AddHours(-[int]'{{ diagnostic_window_hours }}')
-          Get-WinEvent -FilterHashtable @{
-            LogName='System'
-            ProviderName='Service Control Manager'
-            StartTime=$startTime
-          } -ErrorAction SilentlyContinue |
-            Where-Object { $_.Message -like "*$serviceName*" } |
-            Select-Object -First 20 TimeCreated, Id, LevelDisplayName, ProviderName, Message |
-            ConvertTo-Json -Depth 5
-      changed_when: false
-      register: service_control_manager_events
-
-    - name: Query application events related to service or SQL
-      ansible.windows.win_powershell:
-        script: |
-          $ErrorActionPreference = 'Stop'
-          $serviceName = '{{ diagnostic_service_name }}'
-          $startTime = (Get-Date).AddHours(-[int]'{{ diagnostic_window_hours }}')
-          Get-WinEvent -FilterHashtable @{
-            LogName='Application'
-            StartTime=$startTime
-          } -ErrorAction SilentlyContinue |
-            Where-Object {
-              $_.ProviderName -ne 'Ansible' -and (
-                $_.Message -like "*$serviceName*" -or
-                $_.ProviderName -like '*SQL*' -or
-                $_.ProviderName -like '*MSSQL*'
-              )
-            } |
-            Select-Object -First 20 TimeCreated, Id, LevelDisplayName, ProviderName, Message |
-            ConvertTo-Json -Depth 5
-      changed_when: false
-      register: application_events
-
-    - name: Print read-only diagnostic report
-      ansible.builtin.debug:
-        msg:
-          mode: read_only
-          host: "{{ inventory_hostname }}"
-          service_name: "{{ diagnostic_service_name }}"
-          alert_name: "{{ diagnostic_alert_name }}"
-          service_state: "{{ service_state.output | default([]) }}"
-          service_control_manager_events: "{{ service_control_manager_events.output | default([]) }}"
-          application_events: "{{ application_events.output | default([]) }}"
-          safety: No restart, service change, registry change, file change, or remediation was performed.
+        msg: "DIAGNOSTIC_RESULT_JSON={{ diagnostic_result | to_json }}"

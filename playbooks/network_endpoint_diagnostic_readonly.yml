@@ -1,0 +1,69 @@
+---
+- name: Read-only network endpoint diagnostic
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    diagnostic_target_address: "{{ target_address | default('') }}"
+    diagnostic_expected_ports: "{{ expected_ports | default('') }}"
+    diagnostic_alert_name: "{{ alert_name | default('') }}"
+    diagnostic_ports: "{{ diagnostic_expected_ports.split(',') | map('trim') | reject('equalto', '') | list }}"
+
+  tasks:
+    - name: Validate network diagnostic input
+      ansible.builtin.assert:
+        that:
+          - diagnostic_target_address | length > 0
+          - diagnostic_ports | length <= 20
+
+    - name: Resolve target address
+      ansible.builtin.command:
+        argv: [getent, ahosts, "{{ diagnostic_target_address }}"]
+      changed_when: false
+      failed_when: false
+      register: dns_result
+
+    - name: Test ICMP reachability
+      ansible.builtin.command:
+        argv: [ping, -c, "3", -W, "2", "{{ diagnostic_target_address }}"]
+      changed_when: false
+      failed_when: false
+      register: ping_result
+
+    - name: Test expected TCP ports
+      ansible.builtin.wait_for:
+        host: "{{ diagnostic_target_address }}"
+        port: "{{ item | int }}"
+        state: started
+        connect_timeout: 3
+        timeout: 5
+      loop: "{{ diagnostic_ports }}"
+      changed_when: false
+      failed_when: false
+      register: port_results
+
+    - name: Build structured network diagnostic result
+      ansible.builtin.set_fact:
+        diagnostic_result:
+          schema_version: "1.0"
+          mode: read_only
+          profile: network_endpoint
+          collected_at_utc: "{{ ansible_date_time.iso8601 }}"
+          target:
+            address: "{{ diagnostic_target_address }}"
+            alert: "{{ diagnostic_alert_name }}"
+          dns:
+            success: "{{ dns_result.rc == 0 }}"
+            records: "{{ dns_result.stdout_lines }}"
+            error: "{{ dns_result.stderr }}"
+          icmp:
+            success: "{{ ping_result.rc == 0 }}"
+            output: "{{ ping_result.stdout_lines }}"
+          tcp_ports: "{{ port_results.results | default([]) }}"
+          safety: Only DNS, ICMP, and TCP connection checks were performed.
+      changed_when: false
+
+    - name: Print structured read-only diagnostic report
+      ansible.builtin.debug:
+        msg: "DIAGNOSTIC_RESULT_JSON={{ diagnostic_result | to_json }}"
