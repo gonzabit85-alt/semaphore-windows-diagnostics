@@ -65,9 +65,11 @@
             StartTime=$startTime
           } -ErrorAction SilentlyContinue |
             Where-Object {
-              $_.Message -like "*$serviceName*" -or
-              $_.ProviderName -like '*SQL*' -or
-              $_.ProviderName -like '*MSSQL*'
+              $_.ProviderName -ne 'Ansible' -and (
+                $_.Message -like "*$serviceName*" -or
+                $_.ProviderName -like '*SQL*' -or
+                $_.ProviderName -like '*MSSQL*'
+              )
             } |
             Select-Object -First 20 TimeCreated, Id, LevelDisplayName, ProviderName, Message |
             ConvertTo-Json -Depth 5
