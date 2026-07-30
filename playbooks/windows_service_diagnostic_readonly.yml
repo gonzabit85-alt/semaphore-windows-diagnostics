@@ -1,0 +1,87 @@
+---
+- name: Read-only diagnostic for Windows service alert
+  hosts: "{{ target_host | default('windows_alerts') }}"
+  gather_facts: false
+
+  vars:
+    diagnostic_window_hours: "{{ window_hours | default(6) }}"
+    diagnostic_service_name: "{{ service_name | default('') }}"
+    diagnostic_alert_name: "{{ alert_name | default('') }}"
+
+  tasks:
+    - name: Validate service_name input
+      ansible.builtin.assert:
+        that:
+          - diagnostic_service_name | length > 0
+        fail_msg: service_name is required for read-only service diagnostics
+
+    - name: Print diagnostic scope
+      ansible.builtin.debug:
+        msg:
+          mode: read_only
+          host: "{{ inventory_hostname }}"
+          ansible_host: "{{ ansible_host | default(inventory_hostname) }}"
+          alert_name: "{{ diagnostic_alert_name }}"
+          service_name: "{{ diagnostic_service_name }}"
+          window_hours: "{{ diagnostic_window_hours }}"
+          safety: No corrective action is executed by this playbook.
+
+    - name: Query Windows service state
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $serviceName = '{{ diagnostic_service_name }}'
+          Get-CimInstance Win32_Service -Filter "Name='$serviceName'" |
+            Select-Object Name, DisplayName, State, Status, StartMode, StartName, ExitCode, ProcessId, PathName |
+            ConvertTo-Json -Depth 4
+      changed_when: false
+      register: service_state
+
+    - name: Query Service Control Manager events
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $serviceName = '{{ diagnostic_service_name }}'
+          $startTime = (Get-Date).AddHours(-[int]'{{ diagnostic_window_hours }}')
+          Get-WinEvent -FilterHashtable @{
+            LogName='System'
+            ProviderName='Service Control Manager'
+            StartTime=$startTime
+          } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -like "*$serviceName*" } |
+            Select-Object -First 20 TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+            ConvertTo-Json -Depth 5
+      changed_when: false
+      register: service_control_manager_events
+
+    - name: Query application events related to service or SQL
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+          $serviceName = '{{ diagnostic_service_name }}'
+          $startTime = (Get-Date).AddHours(-[int]'{{ diagnostic_window_hours }}')
+          Get-WinEvent -FilterHashtable @{
+            LogName='Application'
+            StartTime=$startTime
+          } -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.Message -like "*$serviceName*" -or
+              $_.ProviderName -like '*SQL*' -or
+              $_.ProviderName -like '*MSSQL*'
+            } |
+            Select-Object -First 20 TimeCreated, Id, LevelDisplayName, ProviderName, Message |
+            ConvertTo-Json -Depth 5
+      changed_when: false
+      register: application_events
+
+    - name: Print read-only diagnostic report
+      ansible.builtin.debug:
+        msg:
+          mode: read_only
+          host: "{{ inventory_hostname }}"
+          service_name: "{{ diagnostic_service_name }}"
+          alert_name: "{{ diagnostic_alert_name }}"
+          service_state: "{{ service_state.output | default([]) }}"
+          service_control_manager_events: "{{ service_control_manager_events.output | default([]) }}"
+          application_events: "{{ application_events.output | default([]) }}"
+          safety: No restart, service change, registry change, file change, or remediation was performed.
