@@ -1,0 +1,178 @@
+---
+- name: Read-only diagnostic for Windows service and process alerts
+  hosts: "{{ target_host | default(host | default('windows_alerts')) }}"
+  gather_facts: false
+
+  vars:
+    diagnostic_alert_name: "{{ alert_name | default(alertname | default('')) }}"
+    diagnostic_service_name: "{{ service_name | default('') }}"
+    diagnostic_process_name: "{{ process_name | default('') }}"
+    diagnostic_expected_ports: "{{ expected_ports | default('') }}"
+    diagnostic_window_hours: "{{ window_hours | default(6) | int }}"
+
+  tasks:
+    - name: Validate service process diagnostic input
+      ansible.builtin.assert:
+        that:
+          - diagnostic_service_name | length > 0 or diagnostic_process_name | length > 0 or diagnostic_alert_name == 'proceso_Dispatcher_no_response'
+          - diagnostic_window_hours | int > 0
+          - diagnostic_window_hours | int <= 168
+        fail_msg: service_name or process_name is required and window_hours must be between 1 and 168
+
+    - name: Collect Windows service process diagnostic evidence
+      ansible.windows.win_powershell:
+        parameters:
+          ServiceName: "{{ diagnostic_service_name }}"
+          ProcessName: "{{ diagnostic_process_name }}"
+          AlertName: "{{ diagnostic_alert_name }}"
+          ExpectedPorts: "{{ diagnostic_expected_ports }}"
+          WindowHours: "{{ diagnostic_window_hours | int }}"
+        script: |
+          param(
+            [string]$ServiceName,
+            [string]$ProcessName,
+            [string]$AlertName,
+            [string]$ExpectedPorts,
+            [int]$WindowHours
+          )
+
+          $ErrorActionPreference = 'Stop'
+          $startedAt = (Get-Date).ToUniversalTime()
+          $queryErrors = [System.Collections.Generic.List[string]]::new()
+          $findings = [System.Collections.Generic.List[object]]::new()
+
+          function Add-Finding {
+            param([string]$Severity, [string]$Code, [string]$Message, [string]$Evidence)
+            $findings.Add([ordered]@{ severity = $Severity; code = $Code; message = $Message; evidence = $Evidence })
+          }
+
+          function Convert-EventRecord {
+            param($EventRecord)
+            $message = [string]$EventRecord.Message
+            if ($message.Length -gt 1200) { $message = $message.Substring(0, 1200) }
+            [ordered]@{ time_utc = $EventRecord.TimeCreated.ToUniversalTime().ToString('o'); id = $EventRecord.Id; level = $EventRecord.LevelDisplayName; provider = $EventRecord.ProviderName; message = $message }
+          }
+
+          function Get-ProcessStartTimeUtc {
+            param($Process)
+            try { return $Process.StartTime.ToUniversalTime().ToString('o') } catch { return $null }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($ProcessName) -and $AlertName -eq 'proceso_Dispatcher_no_response') {
+            $ProcessName = 'Dispatcher'
+          }
+
+          $serviceData = $null
+          $dependencies = @()
+          $dependentServices = @()
+          if (-not [string]::IsNullOrWhiteSpace($ServiceName)) {
+            $escapedServiceName = $ServiceName.Replace("'", "''")
+            $service = Get-CimInstance Win32_Service -Filter "Name='$escapedServiceName'" -ErrorAction SilentlyContinue
+            if (-not $service) {
+              Add-Finding 'critical' 'service_not_found' "Service '$ServiceName' was not found." 'Win32_Service returned no record.'
+            } else {
+              $serviceData = [ordered]@{
+                name = $service.Name
+                display_name = $service.DisplayName
+                state = $service.State
+                status = $service.Status
+                start_mode = $service.StartMode
+                start_name = $service.StartName
+                exit_code = $service.ExitCode
+                process_id = $service.ProcessId
+                path_name = $service.PathName
+              }
+              if ($service.StartMode -eq 'Auto' -and $service.State -ne 'Running') {
+                Add-Finding 'critical' 'automatic_service_stopped' 'An automatic service is not running.' "State=$($service.State); StartMode=$($service.StartMode)"
+              }
+              if ([int64]$service.ExitCode -ne 0) {
+                Add-Finding 'warning' 'service_exit_code' 'The service reports a non-zero exit code.' "ExitCode=$($service.ExitCode)"
+              }
+              try {
+                $controller = Get-Service -Name $ServiceName -ErrorAction Stop
+                $dependencies = @($controller.ServicesDependedOn | ForEach-Object { [ordered]@{ name = $_.Name; display_name = $_.DisplayName; status = [string]$_.Status } })
+                $dependentServices = @($controller.DependentServices | ForEach-Object { [ordered]@{ name = $_.Name; display_name = $_.DisplayName; status = [string]$_.Status } })
+                foreach ($dependency in $dependencies) {
+                  if ($dependency.status -ne 'Running') { Add-Finding 'warning' 'dependency_not_running' 'A service dependency is not running.' "$($dependency.name)=$($dependency.status)" }
+                }
+              } catch {
+                $queryErrors.Add("dependencies: $($_.Exception.Message)")
+              }
+              if ([string]::IsNullOrWhiteSpace($ProcessName) -and [int64]$service.ProcessId -gt 0) {
+                try { $ProcessName = (Get-Process -Id $service.ProcessId -ErrorAction Stop).ProcessName } catch { $queryErrors.Add("service_process_name: $($_.Exception.Message)") }
+              }
+            }
+          }
+
+          $processes = @()
+          if (-not [string]::IsNullOrWhiteSpace($ProcessName)) {
+            $processes = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | ForEach-Object {
+              [ordered]@{
+                id = $_.Id
+                name = $_.ProcessName
+                start_time_utc = Get-ProcessStartTimeUtc $_
+                cpu_seconds = [math]::Round($_.CPU, 2)
+                working_set_mb = [math]::Round($_.WorkingSet64 / 1MB, 2)
+                private_memory_mb = [math]::Round($_.PrivateMemorySize64 / 1MB, 2)
+                handles = $_.HandleCount
+                threads = $_.Threads.Count
+                responding = $_.Responding
+              }
+            })
+            if ($processes.Count -eq 0) {
+              Add-Finding 'critical' 'process_not_found' "Process '$ProcessName' was not found." 'Get-Process returned no records.'
+            } elseif (($processes | Where-Object { $_.responding -eq $false }).Count -gt 0) {
+              Add-Finding 'critical' 'process_not_responding' 'One or more matching processes are not responding.' "process=$ProcessName"
+            }
+          }
+
+          $portResults = @()
+          foreach ($portText in @($ExpectedPorts -split ',' | Where-Object { $_ -match '^\s*\d+\s*$' })) {
+            $port = [int]$portText.Trim()
+            $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)
+            $portResults += [ordered]@{ port = $port; listening = $listeners.Count -gt 0; listener_count = $listeners.Count }
+            if ($listeners.Count -eq 0) { Add-Finding 'warning' 'expected_port_not_listening' 'An expected TCP port is not listening.' "port=$port" }
+          }
+
+          $startTime = (Get-Date).AddHours(-$WindowHours)
+          $events = @()
+          try {
+            $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $startTime; Level = 1, 2, 3 } -ErrorAction Stop |
+              Where-Object { $_.ProviderName -eq 'Service Control Manager' -and ([string]::IsNullOrWhiteSpace($ServiceName) -or $_.Message -like "*$ServiceName*") } |
+              Select-Object -First 20 |
+              ForEach-Object { Convert-EventRecord $_ })
+          } catch {
+            if ($_.Exception.Message -notlike '*No events were found*') { $queryErrors.Add("system_events: $($_.Exception.Message)") }
+          }
+          if ($events.Count -gt 0) { Add-Finding 'warning' 'recent_service_events' 'Recent service warning/error events were found.' "count=$($events.Count)" }
+
+          $result = [ordered]@{
+            schema_version = '1.0'
+            mode = 'read_only'
+            profile = 'windows_service_process'
+            collected_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+            duration_ms = [math]::Round(((Get-Date).ToUniversalTime() - $startedAt).TotalMilliseconds)
+            target = [ordered]@{ host = $env:COMPUTERNAME; service = $ServiceName; process = $ProcessName; alert = $AlertName }
+            service = $serviceData
+            dependencies = $dependencies
+            dependent_services = $dependentServices
+            processes = $processes
+            expected_ports = $portResults
+            events = [ordered]@{ system = $events }
+            findings = @($findings)
+            query_errors = @($queryErrors)
+            safety = 'No restart, service change, process change, registry change, file change, or remediation was performed.'
+          }
+
+          $result | ConvertTo-Json -Depth 8 -Compress
+      changed_when: false
+      register: diagnostic_payload
+
+    - name: Parse structured service process diagnostic result
+      ansible.builtin.set_fact:
+        diagnostic_result: "{{ (diagnostic_payload.output | first) | from_json }}"
+      changed_when: false
+
+    - name: Print structured read-only diagnostic report
+      ansible.builtin.debug:
+        msg: "DIAGNOSTIC_RESULT_B64={{ diagnostic_result | to_json | b64encode }}"

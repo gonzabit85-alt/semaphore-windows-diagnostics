@@ -1,0 +1,74 @@
+---
+- name: Read-only diagnostic for Windows host availability alerts
+  hosts: localhost
+  connection: local
+  gather_facts: true
+
+  vars:
+    diagnostic_target_host: "{{ target_host | default(host | default('')) }}"
+    diagnostic_alert_name: "{{ alert_name | default(alertname | default('')) }}"
+    diagnostic_winrm_port: "{{ winrm_port | default(5985) | int }}"
+
+  tasks:
+    - name: Validate host availability diagnostic input
+      ansible.builtin.assert:
+        that:
+          - diagnostic_target_host | length > 0
+          - diagnostic_winrm_port | int > 0
+          - diagnostic_winrm_port | int <= 65535
+        fail_msg: target_host/host and a valid winrm_port are required
+
+    - name: Resolve target host
+      ansible.builtin.command:
+        argv: [getent, ahosts, "{{ diagnostic_target_host }}"]
+      changed_when: false
+      failed_when: false
+      register: dns_result
+
+    - name: Test ICMP reachability from controller
+      ansible.builtin.command:
+        argv: [ping, -c, "3", -W, "2", "{{ diagnostic_target_host }}"]
+      changed_when: false
+      failed_when: false
+      register: ping_result
+
+    - name: Test WinRM TCP reachability from controller
+      ansible.builtin.wait_for:
+        host: "{{ diagnostic_target_host }}"
+        port: "{{ diagnostic_winrm_port }}"
+        state: started
+        connect_timeout: 3
+        timeout: 5
+      changed_when: false
+      failed_when: false
+      register: winrm_port_result
+
+    - name: Build structured host availability diagnostic result
+      ansible.builtin.set_fact:
+        diagnostic_result:
+          schema_version: "1.0"
+          mode: read_only
+          profile: windows_host_availability
+          collected_at_utc: "{{ ansible_date_time.iso8601 }}"
+          target:
+            host: "{{ diagnostic_target_host }}"
+            alert: "{{ diagnostic_alert_name }}"
+            winrm_port: "{{ diagnostic_winrm_port }}"
+          dns:
+            success: "{{ dns_result.rc == 0 }}"
+            records: "{{ dns_result.stdout_lines }}"
+            error: "{{ dns_result.stderr }}"
+          icmp:
+            success: "{{ ping_result.rc == 0 }}"
+            output: "{{ ping_result.stdout_lines }}"
+          winrm_tcp:
+            success: "{{ winrm_port_result.failed is not defined or not winrm_port_result.failed }}"
+            elapsed: "{{ winrm_port_result.elapsed | default(omit) }}"
+            msg: "{{ winrm_port_result.msg | default('') }}"
+          findings: "{{ [] if (dns_result.rc == 0 and ping_result.rc == 0 and (winrm_port_result.failed is not defined or not winrm_port_result.failed)) else [{'severity': 'critical', 'code': 'host_availability_failed', 'message': 'DNS, ICMP, or WinRM TCP check failed from the Ansible controller.', 'evidence': diagnostic_target_host}] }}"
+          safety: Only DNS, ICMP, and TCP connection checks were performed from the Ansible controller. No server state was changed.
+      changed_when: false
+
+    - name: Print structured read-only diagnostic report
+      ansible.builtin.debug:
+        msg: "DIAGNOSTIC_RESULT_B64={{ diagnostic_result | to_json | b64encode }}"

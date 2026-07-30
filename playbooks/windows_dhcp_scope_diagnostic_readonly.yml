@@ -1,0 +1,134 @@
+---
+- name: Read-only diagnostic for Windows DHCP free IP alerts
+  hosts: "{{ target_host | default(host | default('windows_alerts')) }}"
+  gather_facts: false
+
+  vars:
+    diagnostic_alert_name: "{{ alert_name | default(alertname | default('')) }}"
+    diagnostic_scope_id: "{{ scope_id | default(instance | default('')) }}"
+    diagnostic_free_ips_threshold: "{{ free_ips_threshold | default(100) | int }}"
+    diagnostic_window_hours: "{{ window_hours | default(6) | int }}"
+
+  tasks:
+    - name: Validate DHCP diagnostic input
+      ansible.builtin.assert:
+        that:
+          - diagnostic_free_ips_threshold | int >= 0
+          - diagnostic_window_hours | int > 0
+          - diagnostic_window_hours | int <= 168
+        fail_msg: free_ips_threshold must be >= 0 and window_hours must be between 1 and 168
+
+    - name: Collect Windows DHCP diagnostic evidence
+      ansible.windows.win_powershell:
+        parameters:
+          AlertName: "{{ diagnostic_alert_name }}"
+          ScopeId: "{{ diagnostic_scope_id }}"
+          FreeIpsThreshold: "{{ diagnostic_free_ips_threshold | int }}"
+          WindowHours: "{{ diagnostic_window_hours | int }}"
+        script: |
+          param(
+            [string]$AlertName,
+            [string]$ScopeId,
+            [int]$FreeIpsThreshold,
+            [int]$WindowHours
+          )
+
+          $ErrorActionPreference = 'Stop'
+          $startedAt = (Get-Date).ToUniversalTime()
+          $queryErrors = [System.Collections.Generic.List[string]]::new()
+          $findings = [System.Collections.Generic.List[object]]::new()
+
+          function Add-Finding {
+            param([string]$Severity, [string]$Code, [string]$Message, [string]$Evidence)
+            $findings.Add([ordered]@{ severity = $Severity; code = $Code; message = $Message; evidence = $Evidence })
+          }
+
+          function Convert-EventRecord {
+            param($EventRecord)
+            $message = [string]$EventRecord.Message
+            if ($message.Length -gt 1200) { $message = $message.Substring(0, 1200) }
+            [ordered]@{ time_utc = $EventRecord.TimeCreated.ToUniversalTime().ToString('o'); id = $EventRecord.Id; level = $EventRecord.LevelDisplayName; provider = $EventRecord.ProviderName; message = $message }
+          }
+
+          $dhcpService = Get-CimInstance Win32_Service -Filter "Name='DHCPServer'" -ErrorAction SilentlyContinue
+          if (-not $dhcpService) {
+            Add-Finding 'critical' 'dhcp_service_not_found' 'DHCP Server service was not found.' 'Win32_Service returned no DHCPServer record.'
+          } elseif ($dhcpService.State -ne 'Running') {
+            Add-Finding 'critical' 'dhcp_service_not_running' 'DHCP Server service is not running.' "state=$($dhcpService.State)"
+          }
+
+          $dhcpServiceData = $null
+          if ($dhcpService) {
+            $dhcpServiceData = [ordered]@{
+              name = $dhcpService.Name
+              state = $dhcpService.State
+              start_mode = $dhcpService.StartMode
+              process_id = $dhcpService.ProcessId
+            }
+          }
+
+          $scopes = @()
+          try {
+            Import-Module DhcpServer -ErrorAction Stop
+            $scopeStats = if ([string]::IsNullOrWhiteSpace($ScopeId)) {
+              @(Get-DhcpServerv4ScopeStatistics -ErrorAction Stop)
+            } else {
+              @(Get-DhcpServerv4ScopeStatistics -ScopeId $ScopeId -ErrorAction Stop)
+            }
+            $scopes = @($scopeStats | ForEach-Object {
+              if ([int]$_.Free -le $FreeIpsThreshold) {
+                Add-Finding 'critical' 'dhcp_free_ips_below_threshold' 'DHCP scope free IP count is below or equal to threshold.' "scope=$($_.ScopeId) free=$($_.Free) threshold=$FreeIpsThreshold"
+              }
+              [ordered]@{
+                scope_id = [string]$_.ScopeId
+                free = [int]$_.Free
+                in_use = [int]$_.InUse
+                percentage_in_use = [double]$_.PercentageInUse
+                reserved = [int]$_.Reserved
+                pending = [int]$_.Pending
+              }
+            })
+          } catch {
+            $queryErrors.Add("dhcp_scope_statistics: $($_.Exception.Message)")
+            Add-Finding 'critical' 'dhcp_query_failed' 'Failed to query DHCP scope statistics.' $_.Exception.Message
+          }
+
+          $startTime = (Get-Date).AddHours(-$WindowHours)
+          $events = @()
+          try {
+            $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $startTime; Level = 1, 2, 3 } -ErrorAction Stop |
+              Where-Object { $_.ProviderName -like '*DHCP*' -or $_.Message -match '(?i)dhcp' } |
+              Select-Object -First 20 |
+              ForEach-Object { Convert-EventRecord $_ })
+          } catch {
+            if ($_.Exception.Message -notlike '*No events were found*') { $queryErrors.Add("dhcp_events: $($_.Exception.Message)") }
+          }
+
+          $result = [ordered]@{
+            schema_version = '1.0'
+            mode = 'read_only'
+            profile = 'windows_dhcp_scope'
+            collected_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+            duration_ms = [math]::Round(((Get-Date).ToUniversalTime() - $startedAt).TotalMilliseconds)
+            target = [ordered]@{ host = $env:COMPUTERNAME; scope_id = $ScopeId; alert = $AlertName }
+            threshold = [ordered]@{ free_ips = $FreeIpsThreshold }
+            dhcp_service = $dhcpServiceData
+            scopes = $scopes
+            events = [ordered]@{ system = $events }
+            findings = @($findings)
+            query_errors = @($queryErrors)
+            safety = 'No restart, service change, DHCP scope change, lease change, registry change, file change, or remediation was performed.'
+          }
+
+          $result | ConvertTo-Json -Depth 8 -Compress
+      changed_when: false
+      register: diagnostic_payload
+
+    - name: Parse structured DHCP diagnostic result
+      ansible.builtin.set_fact:
+        diagnostic_result: "{{ (diagnostic_payload.output | first) | from_json }}"
+      changed_when: false
+
+    - name: Print structured read-only diagnostic report
+      ansible.builtin.debug:
+        msg: "DIAGNOSTIC_RESULT_B64={{ diagnostic_result | to_json | b64encode }}"

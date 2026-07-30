@@ -1,0 +1,170 @@
+---
+- name: Read-only diagnostic for Windows disk and storage alerts
+  hosts: "{{ target_host | default(host | default('windows_alerts')) }}"
+  gather_facts: false
+
+  vars:
+    diagnostic_alert_name: "{{ alert_name | default(alertname | default('')) }}"
+    diagnostic_drive: "{{ drive_letter | default(instance | default('')) }}"
+    diagnostic_window_hours: "{{ window_hours | default(6) | int }}"
+    diagnostic_free_gb_threshold: "{{ free_gb_threshold | default(0) | float }}"
+    diagnostic_free_tb_threshold: "{{ free_tb_threshold | default(0) | float }}"
+    diagnostic_used_tb_threshold: "{{ used_tb_threshold | default(0) | float }}"
+
+  tasks:
+    - name: Validate disk diagnostic input
+      ansible.builtin.assert:
+        that:
+          - diagnostic_window_hours | int > 0
+          - diagnostic_window_hours | int <= 168
+        fail_msg: window_hours must be between 1 and 168
+
+    - name: Collect Windows disk diagnostic evidence
+      ansible.windows.win_powershell:
+        parameters:
+          AlertName: "{{ diagnostic_alert_name }}"
+          DriveLetter: "{{ diagnostic_drive }}"
+          WindowHours: "{{ diagnostic_window_hours | int }}"
+          FreeGbThreshold: "{{ diagnostic_free_gb_threshold | float }}"
+          FreeTbThreshold: "{{ diagnostic_free_tb_threshold | float }}"
+          UsedTbThreshold: "{{ diagnostic_used_tb_threshold | float }}"
+        script: |
+          param(
+            [string]$AlertName,
+            [string]$DriveLetter,
+            [int]$WindowHours,
+            [double]$FreeGbThreshold,
+            [double]$FreeTbThreshold,
+            [double]$UsedTbThreshold
+          )
+
+          $ErrorActionPreference = 'Stop'
+          $startedAt = (Get-Date).ToUniversalTime()
+          $queryErrors = [System.Collections.Generic.List[string]]::new()
+          $findings = [System.Collections.Generic.List[object]]::new()
+
+          function Add-Finding {
+            param([string]$Severity, [string]$Code, [string]$Message, [string]$Evidence)
+            $findings.Add([ordered]@{ severity = $Severity; code = $Code; message = $Message; evidence = $Evidence })
+          }
+
+          function Convert-EventRecord {
+            param($EventRecord)
+            $message = [string]$EventRecord.Message
+            if ($message.Length -gt 1200) { $message = $message.Substring(0, 1200) }
+            [ordered]@{
+              time_utc = $EventRecord.TimeCreated.ToUniversalTime().ToString('o')
+              id = $EventRecord.Id
+              level = $EventRecord.LevelDisplayName
+              provider = $EventRecord.ProviderName
+              message = $message
+            }
+          }
+
+          if ($AlertName -eq 'critical_win_srv_disk_1gb' -and $FreeGbThreshold -le 0) { $FreeGbThreshold = 1 }
+          if ($AlertName -eq 'crtical_free_storage_5TB' -and $FreeTbThreshold -le 0) { $FreeTbThreshold = 5 }
+          if ($AlertName -eq 'critical_free_storage_3TB' -and $FreeTbThreshold -le 0) { $FreeTbThreshold = 3 }
+          if ($AlertName -eq 'critical_used_storage_above_25TB' -and $UsedTbThreshold -le 0) { $UsedTbThreshold = 25 }
+
+          if (-not [string]::IsNullOrWhiteSpace($DriveLetter)) {
+            $DriveLetter = $DriveLetter.Trim().TrimEnd('\')
+            if ($DriveLetter -notmatch ':$') { $DriveLetter = "${DriveLetter}:" }
+          }
+
+          $logicalDisks = @()
+          try {
+            $logicalDisks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | Where-Object {
+              [string]::IsNullOrWhiteSpace($DriveLetter) -or $_.DeviceID -eq $DriveLetter
+            } | ForEach-Object {
+              $sizeGb = if ($_.Size) { [math]::Round($_.Size / 1GB, 2) } else { 0 }
+              $freeGb = if ($_.FreeSpace) { [math]::Round($_.FreeSpace / 1GB, 2) } else { 0 }
+              $usedGb = [math]::Round($sizeGb - $freeGb, 2)
+              $freePct = if ($_.Size -gt 0) { [math]::Round(($_.FreeSpace / $_.Size) * 100, 2) } else { 0 }
+              if ($FreeGbThreshold -gt 0 -and $freeGb -le $FreeGbThreshold) {
+                Add-Finding 'critical' 'free_gb_below_threshold' 'Free disk space is below the configured GB threshold.' "$($_.DeviceID) free_gb=$freeGb threshold_gb=$FreeGbThreshold"
+              }
+              if ($FreeTbThreshold -gt 0 -and ($freeGb / 1024) -le $FreeTbThreshold) {
+                Add-Finding 'critical' 'free_tb_below_threshold' 'Free disk space is below the configured TB threshold.' "$($_.DeviceID) free_tb=$([math]::Round($freeGb / 1024, 2)) threshold_tb=$FreeTbThreshold"
+              }
+              if ($UsedTbThreshold -gt 0 -and ($usedGb / 1024) -ge $UsedTbThreshold) {
+                Add-Finding 'critical' 'used_tb_above_threshold' 'Used disk space is above the configured TB threshold.' "$($_.DeviceID) used_tb=$([math]::Round($usedGb / 1024, 2)) threshold_tb=$UsedTbThreshold"
+              }
+              [ordered]@{
+                drive = $_.DeviceID
+                volume_name = $_.VolumeName
+                file_system = $_.FileSystem
+                size_gb = $sizeGb
+                used_gb = $usedGb
+                free_gb = $freeGb
+                free_percent = $freePct
+              }
+            })
+          } catch {
+            $queryErrors.Add("logical_disks: $($_.Exception.Message)")
+          }
+
+          if ($DriveLetter -and $logicalDisks.Count -eq 0) {
+            Add-Finding 'critical' 'drive_not_found' 'Requested drive was not found among local fixed disks.' $DriveLetter
+          }
+
+          $volumes = @()
+          try {
+            $volumes = @(Get-Volume | Where-Object {
+              [string]::IsNullOrWhiteSpace($DriveLetter) -or "$($_.DriveLetter):" -eq $DriveLetter
+            } | ForEach-Object {
+              [ordered]@{
+                drive = if ($_.DriveLetter) { "$($_.DriveLetter):" } else { $null }
+                file_system_label = $_.FileSystemLabel
+                file_system = $_.FileSystem
+                health_status = [string]$_.HealthStatus
+                operational_status = [string]$_.OperationalStatus
+                size_gb = if ($_.Size) { [math]::Round($_.Size / 1GB, 2) } else { 0 }
+                size_remaining_gb = if ($_.SizeRemaining) { [math]::Round($_.SizeRemaining / 1GB, 2) } else { 0 }
+              }
+            })
+          } catch {
+            $queryErrors.Add("volumes: $($_.Exception.Message)")
+          }
+
+          $startTime = (Get-Date).AddHours(-$WindowHours)
+          $diskEvents = @()
+          try {
+            $diskEvents = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = $startTime; Level = 1, 2, 3 } -ErrorAction Stop |
+              Where-Object { $_.ProviderName -match '^(disk|Ntfs|volsnap|storahci|stornvme|partmgr)$' -or $_.Message -match '(?i)disk|ntfs|volume|storage' } |
+              Select-Object -First 20 |
+              ForEach-Object { Convert-EventRecord $_ })
+          } catch {
+            if ($_.Exception.Message -notlike '*No events were found*') { $queryErrors.Add("disk_events: $($_.Exception.Message)") }
+          }
+          if ($diskEvents.Count -gt 0) {
+            Add-Finding 'warning' 'recent_disk_events' 'Recent disk or storage warning/error events were found.' "count=$($diskEvents.Count)"
+          }
+
+          $result = [ordered]@{
+            schema_version = '1.0'
+            mode = 'read_only'
+            profile = 'windows_disk'
+            collected_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+            duration_ms = [math]::Round(((Get-Date).ToUniversalTime() - $startedAt).TotalMilliseconds)
+            target = [ordered]@{ host = $env:COMPUTERNAME; drive = $DriveLetter; alert = $AlertName }
+            thresholds = [ordered]@{ free_gb = $FreeGbThreshold; free_tb = $FreeTbThreshold; used_tb = $UsedTbThreshold }
+            disks = $logicalDisks
+            volumes = $volumes
+            events = [ordered]@{ disk = $diskEvents }
+            findings = @($findings)
+            query_errors = @($queryErrors)
+            safety = 'No restart, service change, registry change, file change, disk change, or remediation was performed.'
+          }
+
+          $result | ConvertTo-Json -Depth 8 -Compress
+      changed_when: false
+      register: diagnostic_payload
+
+    - name: Parse structured disk diagnostic result
+      ansible.builtin.set_fact:
+        diagnostic_result: "{{ (diagnostic_payload.output | first) | from_json }}"
+      changed_when: false
+
+    - name: Print structured read-only diagnostic report
+      ansible.builtin.debug:
+        msg: "DIAGNOSTIC_RESULT_B64={{ diagnostic_result | to_json | b64encode }}"

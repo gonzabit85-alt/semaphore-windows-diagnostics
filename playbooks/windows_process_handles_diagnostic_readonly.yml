@@ -1,0 +1,121 @@
+---
+- name: Read-only diagnostic for Windows process handle alerts
+  hosts: "{{ target_host | default(host | default('windows_alerts')) }}"
+  gather_facts: false
+
+  vars:
+    diagnostic_alert_name: "{{ alert_name | default(alertname | default('')) }}"
+    diagnostic_process_name: "{{ process_name | default('sparcsn4') }}"
+    diagnostic_handles_threshold: "{{ handles_threshold | default(6000) | int }}"
+    diagnostic_window_hours: "{{ window_hours | default(6) | int }}"
+
+  tasks:
+    - name: Validate process handles diagnostic input
+      ansible.builtin.assert:
+        that:
+          - diagnostic_process_name | length > 0
+          - diagnostic_handles_threshold | int > 0
+          - diagnostic_window_hours | int > 0
+          - diagnostic_window_hours | int <= 168
+        fail_msg: process_name, handles_threshold, and window_hours are required
+
+    - name: Collect Windows process handles diagnostic evidence
+      ansible.windows.win_powershell:
+        parameters:
+          ProcessName: "{{ diagnostic_process_name }}"
+          AlertName: "{{ diagnostic_alert_name }}"
+          HandlesThreshold: "{{ diagnostic_handles_threshold | int }}"
+          WindowHours: "{{ diagnostic_window_hours | int }}"
+        script: |
+          param(
+            [string]$ProcessName,
+            [string]$AlertName,
+            [int]$HandlesThreshold,
+            [int]$WindowHours
+          )
+
+          $ErrorActionPreference = 'Stop'
+          $startedAt = (Get-Date).ToUniversalTime()
+          $queryErrors = [System.Collections.Generic.List[string]]::new()
+          $findings = [System.Collections.Generic.List[object]]::new()
+
+          function Add-Finding {
+            param([string]$Severity, [string]$Code, [string]$Message, [string]$Evidence)
+            $findings.Add([ordered]@{ severity = $Severity; code = $Code; message = $Message; evidence = $Evidence })
+          }
+
+          function Convert-EventRecord {
+            param($EventRecord)
+            $message = [string]$EventRecord.Message
+            if ($message.Length -gt 1200) { $message = $message.Substring(0, 1200) }
+            [ordered]@{ time_utc = $EventRecord.TimeCreated.ToUniversalTime().ToString('o'); id = $EventRecord.Id; level = $EventRecord.LevelDisplayName; provider = $EventRecord.ProviderName; message = $message }
+          }
+
+          function Get-ProcessStartTimeUtc {
+            param($Process)
+            try { return $Process.StartTime.ToUniversalTime().ToString('o') } catch { return $null }
+          }
+
+          $processes = @(Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.HandleCount -ge $HandlesThreshold) {
+              Add-Finding 'critical' 'handles_above_threshold' 'Process handle count is above or equal to the configured threshold.' "pid=$($_.Id) handles=$($_.HandleCount) threshold=$HandlesThreshold"
+            }
+            [ordered]@{
+              id = $_.Id
+              name = $_.ProcessName
+              start_time_utc = Get-ProcessStartTimeUtc $_
+              cpu_seconds = [math]::Round($_.CPU, 2)
+              working_set_mb = [math]::Round($_.WorkingSet64 / 1MB, 2)
+              private_memory_mb = [math]::Round($_.PrivateMemorySize64 / 1MB, 2)
+              handles = $_.HandleCount
+              threads = $_.Threads.Count
+              responding = $_.Responding
+            }
+          })
+          if ($processes.Count -eq 0) {
+            Add-Finding 'critical' 'process_not_found' "Process '$ProcessName' was not found." 'Get-Process returned no records.'
+          }
+
+          $topHandles = @(Get-Process | Sort-Object HandleCount -Descending | Select-Object -First 10 | ForEach-Object {
+            [ordered]@{ id = $_.Id; name = $_.ProcessName; handles = $_.HandleCount; working_set_mb = [math]::Round($_.WorkingSet64 / 1MB, 2) }
+          })
+
+          $startTime = (Get-Date).AddHours(-$WindowHours)
+          $events = @()
+          try {
+            $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; StartTime = $startTime; Level = 1, 2, 3 } -ErrorAction Stop |
+              Where-Object { $_.Message -like "*$ProcessName*" -or $_.ProviderName -like "*$ProcessName*" } |
+              Select-Object -First 20 |
+              ForEach-Object { Convert-EventRecord $_ })
+          } catch {
+            if ($_.Exception.Message -notlike '*No events were found*') { $queryErrors.Add("application_events: $($_.Exception.Message)") }
+          }
+
+          $result = [ordered]@{
+            schema_version = '1.0'
+            mode = 'read_only'
+            profile = 'windows_process_handles'
+            collected_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+            duration_ms = [math]::Round(((Get-Date).ToUniversalTime() - $startedAt).TotalMilliseconds)
+            target = [ordered]@{ host = $env:COMPUTERNAME; process = $ProcessName; alert = $AlertName }
+            threshold = [ordered]@{ handles = $HandlesThreshold }
+            processes = $processes
+            top_processes_by_handles = $topHandles
+            events = [ordered]@{ application = $events }
+            findings = @($findings)
+            query_errors = @($queryErrors)
+            safety = 'No restart, process change, service change, registry change, file change, or remediation was performed.'
+          }
+
+          $result | ConvertTo-Json -Depth 8 -Compress
+      changed_when: false
+      register: diagnostic_payload
+
+    - name: Parse structured process handles diagnostic result
+      ansible.builtin.set_fact:
+        diagnostic_result: "{{ (diagnostic_payload.output | first) | from_json }}"
+      changed_when: false
+
+    - name: Print structured read-only diagnostic report
+      ansible.builtin.debug:
+        msg: "DIAGNOSTIC_RESULT_B64={{ diagnostic_result | to_json | b64encode }}"
