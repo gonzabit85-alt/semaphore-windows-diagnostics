@@ -49,4 +49,4 @@
 
     - name: Print structured read-only diagnostic report
       ansible.builtin.debug:
-        msg: "DIAGNOSTIC_RESULT_JSON={{ diagnostic_result | to_json }}"
+        msg: "DIAGNOSTIC_RESULT_B64={{ diagnostic_result | to_json | b64encode }}"

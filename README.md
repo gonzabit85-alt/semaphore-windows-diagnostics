@@ -2,7 +2,7 @@
 
 Read-only Ansible diagnostics for alerts triggered by n8n and executed by Semaphore.
 
-The repository intentionally contains no credentials and no corrective actions. Every playbook emits one machine-readable line prefixed with `DIAGNOSTIC_RESULT_JSON=`.
+The repository intentionally contains no credentials and no corrective actions. Every playbook emits one machine-readable Base64 payload prefixed with `DIAGNOSTIC_RESULT_B64=`. Decoding the payload returns the versioned JSON report without log line-wrapping corruption.
 
 ## Playbooks
 
